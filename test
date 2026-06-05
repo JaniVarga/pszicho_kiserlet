@@ -1,0 +1,125 @@
+import cv2
+import numpy as np
+from ultralytics import YOLO
+from boxmot.trackers.tracker_zoo import create_tracker as tracker_factory
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+import csv
+import datetime
+
+class ObjectTracking:
+    def __init__(self, camera_id=1, model_path=""):
+        self.cam_id = camera_id
+        self.model = YOLO(model_path)
+
+        # 1. BoxMOT SOTA Tracker
+        # self.tracker = tracker_factory(
+        #     tracker_type='deepocsort',
+        #     tracker_config=None,
+        #     reid_weights='osnet_x0_25_msmt17.pt',
+        #     device='cpu',
+        #     half=False
+        # )
+
+        self.tracker = tracker_factory(
+            tracker_type='bytetrack',  # deepocsort helyett
+            tracker_config=None,
+            reid_weights=None,  # Itt már nem kell modell!
+            device='cpu',
+            half=False
+        )
+
+        # 2. ÚJ MEDIAPIPE AI INICIALIZÁLÁSA (Blendshapes)
+        base_options = python.BaseOptions(model_asset_path='face_landmarker.task')
+        options = vision.FaceLandmarkerOptions(
+            base_options=base_options,
+            output_face_blendshapes=True,  # EZ A LÉNYEG: Bekapcsolja az 52 arcizom elemzést!
+            output_facial_transformation_matrixes=False,
+            num_faces=1
+        )
+        self.detector = vision.FaceLandmarker.create_from_options(options)
+
+        print("YOLO, DeepOCSORT és az Új MediaPipe Blendshapes sikeresen betöltve!")
+
+    def run(self):
+        frame_id = 1
+        header_written = False
+        timestep = datetime.datetime.now().strftime("%d%m%Y_%H%M%S")
+        with open(f"data_{timestep}.csv", "a", newline="") as f:
+            writer = csv.writer(f)
+
+            cap = cv2.VideoCapture(self.cam_id)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 720)
+
+            if not cap.isOpened():
+                print(f"Hiba a kamerával. (ID: {self.cam_id})")
+                return
+
+            try:
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+
+                    results = self.model(source=frame, classes=[0], verbose=False)
+
+                    detections = []
+                    for result in results:
+                        for data in result.boxes.data.tolist():
+                            detections.append(data)
+
+                    dets_np = np.array(detections) if detections else np.empty((0, 6))
+                    tracks = self.tracker.update(dets_np, frame)
+
+                    for track in tracks:
+                        x1, y1, x2, y2 = map(int, track[:4])
+                        track_id = int(track[4])
+
+                        h, w = frame.shape[:2]
+                        x1_c, y1_c = max(0, x1), max(0, y1)
+                        x2_c, y2_c = min(w, x2), min(h, y2)
+
+                        roi = frame[y1_c:y2_c, x1_c:x2_c]
+
+                        if roi.shape[0] > 150 and roi.shape[1] > 150:
+                            # 1. A MediaPipe most már egy speciális 'mp.Image' formátumot vár
+                            rgb_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
+                            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_roi)
+
+                            # 2. Lefuttatjuk az okos AI detektálást
+                            detection_result = self.detector.detect(mp_image)
+
+                            # 3. Kinyerjük az arcizom adatokat (ha talált arcot)
+                            if detection_result.face_blendshapes:
+                                blendshapes = detection_result.face_blendshapes[0]
+
+                                if not header_written:
+                                    category_names = [blendshape.category_name for blendshape in blendshapes]
+                                    category_names[:0] = ["frame_id", "ID"]
+                                    writer.writerow(category_names)
+                                    header_written = True
+
+                                scores = [blendshape.score for blendshape in blendshapes]
+                                scores[:0] = [frame_id, track_id]
+                                writer.writerow(scores)
+
+                            cv2.imshow("Aktive face", roi)
+
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                        cv2.putText(frame, f"ID: {track_id}", (x1, y1 - 10), cv2.FONT_HERSHEY_DUPLEX, 0.7, (0, 255, 0), 2)
+
+                    cv2.imshow("Main Camera", frame)
+                    frame_id += 1
+                    if cv2.waitKey(1) & 0xFF == ord('q'): break
+            except Exception as e:
+                print(f"Váratlan hiba történt a feldolgozás során: {e}")
+            finally:
+                cap.release()
+                cv2.destroyAllWindows()
+                print("Lezárva.")
+
+
+if __name__ == "__main__":
+    tracker = ObjectTracking(camera_id=0, model_path="yolo26n_openvino_model")
+    tracker.run()
